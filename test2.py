@@ -1,6 +1,8 @@
 import math
 import torch
+import os
 # from torch import distributions
+import numpy as np
 
 import matplotlib.pyplot as plt
 
@@ -13,6 +15,9 @@ from pyro import infer
 from pyro import distributions
 from pyro import poutine
 from pyro.infer import SVI, Trace_ELBO
+
+def is_pos_def(x):
+    return np.all(np.linalg.eigvals(x) > 0)
 
 def u_model(data, u=None):
     # starting points for params
@@ -38,21 +43,22 @@ def u_model(data, u=None):
         )
 
 def u_guide(data, u=None):
+    c4 = math.log(3, 10)/1.96
+    c3 = c4
     gamma_loc = pyro.param(
         'gamma_loc',
         torch.tensor([0.0,0.0])
     )
     gamma_scale = pyro.param(
         'gamma_scale',
-        torch.tensor([[1.0,0.0], [0.0,1.0]])
-    )
+        torch.tensor([[c4,c3/2], [c3/2,c4]]), constraint=distributions.constraints.positive_definite)
     big_e_loc = pyro.param(
         'big_e_loc',
         torch.tensor(0.0)
     )
     big_e_scale = pyro.param(
         'big_e_scale',
-        torch.tensor(1.0)
+        torch.tensor(c4), constraint=distributions.constraints.positive
     )
     gammas = pyro.sample(
         "gammas",
@@ -66,13 +72,13 @@ def u_guide(data, u=None):
 def y_model(data, y=None):
     x, t, u_ = data["x"], data["t"], data["u"]
     # starting points for params
-    betas_mu_loc = torch.tensor([0.0, 0.0, 0.0])
-    betas_mu_scale = torch.tensor([[1.0,0.0, 0.0], [0.0,1.0,0.0], [0.0,0.0,1.0]])
+    betas_eta_loc = torch.tensor([0.0, 0.0, 0.0])
+    betas_eta_scale = torch.tensor([[1.0,0.0, 0.0], [0.0,1.0,0.0], [0.0,0.0,1.0]])
     lambda_loc = torch.tensor(0)
     lambda_scale = torch.tensor(1)
-    betas_mu = pyro.sample("betas_mu", distributions.MultivariateNormal(betas_mu_loc, betas_mu_scale))
-    lambda_ = pyro.sample("lambda", distributions.Normal(lamda_loc, lamda_scale))
-    logits = betas_mu[0] + betas_mu[1]*t + lamda_*u + betas_mu[2]*x
+    betas_eta = pyro.sample("betas_eta", distributions.MultivariateNormal(betas_eta_loc, betas_eta_scale))
+    lambda_ = pyro.sample("lambda", distributions.Normal(lambda_loc, lambda_scale))
+    logits = betas_eta[0] + betas_eta[1]*t + lambda_*u_ + betas_eta[2]*x
     y_sigma = pyro.sample("sigma", distributions.Uniform(0., 10.))
     with pyro.plate("data", len(x)):
         y = pyro.sample(
@@ -82,24 +88,36 @@ def y_model(data, y=None):
         )
 
 def y_guide(data, y=None):
-    betas_mu_loc = pyro.param(
-        "betas_mu_loc",
+    c1 = math.log(6, 10) / 1.96
+    # base 10??
+    # uninformative prior for betas and eta
+    betas_eta_loc = pyro.param(
+        "betas_eta_loc",
         torch.tensor([0.0,0.0,0.0])
     )
-    betas_mu_scale = pyro.param(
-        "betas_mu_scale",
-        torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    )
+    betas_eta_scale = pyro.param(
+        "betas_eta_scale",
+        torch.tensor([[1.0, 0.0, 0.0],
+                      [0.0, 1.0, 0.0],
+                      [0.0, 0.0, 1.0]]),
+        constraint=distributions.constraints.positive_definite)
     lambda_loc = pyro.param(
         "lambda_loc", torch.tensor(0.0)
     )
     lambda_scale = pyro.param(
-        "lambda_scale", torch.tensor(1.0)
+        "lambda_scale", torch.tensor(c1), constraint=distributions.constraints.positive
     )
-    betas_mu  = pyro.sample(
-        "betas_mu",
-        distributions.MultivariateNormal(betas_mu_loc, betas_mu_scale)
-    )
+    #print("det", np.linalg.det(betas_eta_scale.detach().numpy()))
+    try:
+        betas_eta  = pyro.sample(
+            "betas_eta",
+            distributions.MultivariateNormal(betas_eta_loc, betas_eta_scale)
+        )
+
+
+    except:
+        import pdb
+        pdb.set_trace()
 
     lambda_ = pyro.sample(
         "lambda",
@@ -166,7 +184,7 @@ class RegressionModelU(nn.PyroModule):
                 temperature=torch.tensor(2/3), logits=u_mean), obs=u_)
         return u_mean
 
-def train(modelY, modelU, guideY, guideU, data, u_guess, iters=10, svi_iters=10, burn_in=0.2):
+def train(modelY, modelU, guideY, guideU, data, u_guess, real_latents, iters=2, svi_iters=5, burn_in=0.2):
     beta0s = []
     beta1s = []
     lambdas = []
@@ -176,7 +194,7 @@ def train(modelY, modelU, guideY, guideU, data, u_guess, iters=10, svi_iters=10,
     gamma0s = []
     # train takes in whole data set and iterates for each data point in batch
     optimiserY = pyro.optim.Adam({"lr": 0.1})
-    optimiserU = pyro.optim.Adam({"lr": 0.01})
+    optimiserU = pyro.optim.Adam({"lr": 0.1})
     sviY = SVI(modelY, guideY, optimiserY, loss=Trace_ELBO())
     sviU = SVI(modelU, guideU, optimiserU, loss=Trace_ELBO())
     first = True
@@ -187,21 +205,25 @@ def train(modelY, modelU, guideY, guideU, data, u_guess, iters=10, svi_iters=10,
         pyro.clear_param_store()
         for j in range(svi_iters):
             loss = sviU.step(data, u_)
-            gamma_loc = pyro.param("gamma_loc")
-            gamma0 = gamma_loc[0]
-            gamma1 = gamma_loc[1]
+            gamma = pyro.param("gamma_loc")
+            gamma0 = gamma[0]
+            gamma1 = gamma[1]
             big_e = pyro.param("big_e_loc")
+            if j % 100 == 0:
+                print("u loss: {}".format(loss))
 
         print("**************")
-        print("gamma1", gamma1)
-        print("gamma0", gamma0)
-        print("big e", big_e)
+        print("gamma1 pred: {:.2f} gamma1 actual: {:.2f}".format(
+            gamma1, real_latents["gamma1s"]))
+        print(
+            "gamma0 pred: {:.2f} gamma0 actual: {:.2f}".format(gamma0, real_latents["gamma0s"]))
+        print("big e pred: {:.2f} big e actual: {:.2f}".format(big_e, real_latents["big_es"]))
         # now we have some updated model parameters for the u model
         # so we sample another u:
         if i > burn_in*iters:
             gamma1s.append(gamma1.item())
             gamma0s.append(gamma0.item())
-            big_es.append(big_E.item())
+            big_es.append(big_e.item())
 
         #new_u_logits = modelU(data)
         new_u_logits  = return_u_logits(data["t"], gamma0, gamma1, big_e, data["x"])
@@ -213,18 +235,20 @@ def train(modelY, modelU, guideY, guideU, data, u_guess, iters=10, svi_iters=10,
         pyro.clear_param_store()
         for j in range(svi_iters):
             loss = sviY.step(data, y)
-            #print("lossy", loss)
-        betas_mu = pyro.param("betas_mu_loc")
-        beta0, beta1, mu = betas_mu[0], betas_mu[1], betas_mu[2]
+            if j % 100 == 0:
+                print("y loss: {}".format(loss) )
+        #print("lossy", loss)
+        betas_eta = pyro.param("betas_eta_loc")
+        beta0, beta1, eta = betas_eta[0], betas_eta[1], betas_eta[2]
         lambda_ = pyro.param("lambda_loc")
         if i > burn_in*iters:
             beta1s.append(beta1.item())
             beta0s.append(beta0.item())
             lambdas.append(lambda_.item())
             etas.append(eta.item())
-        print("beta1s", beta1)
-        print("beta0", beta0)
-        print("lambda", lambda_)
+        print("beta1s pred: {:.2f} beta1s actual: {:.2f}".format(beta1, real_latents["beta1s"]))
+        print("beta0s pred: {:.2f} beta0s actual: {:.2f}".format(beta0, real_latents["beta0s"]))
+        print("lambda pred: {:.2f} lambda actual: {:.2f}".format(lambda_, real_latents["lambdas"]))
 
     dict_ = {"beta0s": beta0s, "beta1s": beta1s, "lambdas": lambdas,
             "etas": etas, "gamma0s": gamma0s, "gamma1s": gamma1s, "big_es": big_es}
@@ -238,9 +262,34 @@ def return_y_logits(t, b0, b1, lamb, eta, u, x):
 def return_u_logits(t, gamma0, gamma1, E, x):
   return gamma0 + gamma1*t + E*x
 
-real_latents = {"beta0s": 0.3, "beta1s": -0.1, "lambdas": 0,
-            "etas": -0.4, "gamma0s": -0.3, "gamma1s": 0.4, "big_es": 0.2}
+def return_real_latents(set_gammas=None, set_lambda=None):
+    c1 = math.log(6) / 1.96
+    betas_eta_dist = distributions.MultivariateNormal(
+        torch.tensor([0.0, 0.0, 0.0]), torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]))
+    betas_eta = betas_eta_dist.sample()
+    beta0 = betas_eta[0]
+    beta1 = betas_eta[1]
+    eta = betas_eta[2]
+    lambda_dist = distributions.Normal(torch.tensor(0.0), torch.tensor(c1))
+    lambda_ = lambda_dist.sample()
+    gammas_dist = distributions.MultivariateNormal(torch.tensor([0.0,0.0]), torch.tensor([[c1, c1/2], [c1/2, c1]]))
+    gammas = gammas_dist.sample()
+    gamma0 = gammas[0]
+    gamma1 = gammas[1]
+    big_e_dist = distributions.Normal(torch.tensor(0.0), torch.tensor(c1))
+    big_e = big_e_dist.sample()
+    if set_gammas != None:
+        gamma0 = set_gammas[0]
+        gamma1 = set_gammas[1]
+    if set_lambda != None:
+        lambda_ = set_lambda
+    return {"beta0s": beta0, "beta1s": beta1, "lambdas": lambda_,
+            "etas": eta, "gamma0s": gamma0, "gamma1s": gamma1, "big_es": big_e}
 
+
+
+
+real_latents = return_real_latents(set_lambda=0)
 t_sampler = distributions.Bernoulli(probs=0.5)
 x_sampler = distributions.Normal(0, 1)
 u_guess_sampler = distributions.Bernoulli(probs=0.5)
@@ -266,19 +315,24 @@ modelY = RegressionModelY(3, 1)
 modelU = RegressionModelU(2, 1)
 #trace = poutine.trace(modelY).get_trace(dataY,y_real)
 #print(trace.format_shapes())
+modelY = y_model
+modelU = u_model
 guideY = infer.autoguide.AutoDiagonalNormal(modelY)
 guideU = infer.autoguide.AutoDiagonalNormal(modelU)
 
-modelY = y_model
-modelU = u_model
+
+
 #trace = poutine.trace(modelY).get_trace(dataY,y_real)
 #print(trace.format_shapes())
 guideY = y_guide
 guideU = u_guide
 
-dict_is = train(modelY, modelU, guideY, guideU, data, u_guess, iters=400, svi_iters=200)
+dict_is = train(modelY, modelU, guideY, guideU, data, u_guess, real_latents, iters=100, svi_iters=400, burn_in=0.2)
 
+exp_name = "lambda_zero"
+os.mkdir(os.path.expanduser("~/causal_stuff/results/"+exp_name))
 for key, value in dict_is.items():
     print("plot for {} should be {}".format(key, real_latents[key]))
     plt.hist(value)
+    plt.savefig(os.path.expanduser("~/causal_stuff/results/{}/{}_{:.2f}.jpg".format(exp_name, key, real_latents[key])))
     plt.show()
